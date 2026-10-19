@@ -710,6 +710,19 @@ async function openNewSessionInProject(targetPath, targetProfile, targetId, pres
   return true
 }
 
+// The gateway is often a long-lived background service with no display session
+// in its environment, so a bare `code` starts, finds no display and exits
+// silently. Rebuild the display env first (prefer Wayland, fall back to X11).
+const VSCODE_LAUNCH_SCRIPT = [
+  'rt="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"',
+  'export XDG_RUNTIME_DIR="$rt"',
+  'flags=""',
+  'if [ -z "$WAYLAND_DISPLAY" ]; then WAYLAND_DISPLAY=$(ls "$rt" 2>/dev/null | grep -E "^wayland-[0-9]+$" | head -1); fi',
+  'if [ -n "$WAYLAND_DISPLAY" ] && [ -S "$rt/$WAYLAND_DISPLAY" ]; then export WAYLAND_DISPLAY; unset DISPLAY; flags="--ozone-platform=wayland"',
+  'elif [ -z "$DISPLAY" ]; then x=$(ls /tmp/.X11-unix 2>/dev/null | grep -E "^X[0-9]+$" | head -1); [ -n "$x" ] && export DISPLAY=":${x#X}"; fi',
+  'nohup code $flags -- "$1" >/dev/null 2>&1 &'
+].join('\n')
+
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`
 }
@@ -764,7 +777,7 @@ function OpenInVSCodeButton({ cwd, placement }) {
     setOpening(true)
     try {
       const res = await host.request('shell.exec', {
-        command: `nohup code -- ${shellQuote(target)} >/dev/null 2>&1 &`
+        command: `sh -c ${shellQuote(VSCODE_LAUNCH_SCRIPT)} sh ${shellQuote(target)}`
       })
       if (res?.code && res.code !== 0) {
         throw new Error(String(res.stderr || 'code exited with an error').trim())
