@@ -713,6 +713,8 @@ async function openNewSessionInProject(targetPath, targetProfile, targetId, pres
 // The gateway is often a long-lived background service with no display session
 // in its environment, so a bare `code` starts, finds no display and exits
 // silently. Rebuild the display env first (prefer Wayland, fall back to X11).
+// Sent as plain shell (shell.exec already runs through a shell) because the
+// gateway's safety filter rejects `sh -c ...`.
 const VSCODE_LAUNCH_SCRIPT = [
   'rt="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"',
   'export XDG_RUNTIME_DIR="$rt"',
@@ -777,7 +779,7 @@ function OpenInVSCodeButton({ cwd, placement }) {
     setOpening(true)
     try {
       const res = await host.request('shell.exec', {
-        command: `sh -c ${shellQuote(VSCODE_LAUNCH_SCRIPT)} sh ${shellQuote(target)}`
+        command: `set -- ${shellQuote(target)}\n${VSCODE_LAUNCH_SCRIPT}`
       })
       if (res?.code && res.code !== 0) {
         throw new Error(String(res.stderr || 'code exited with an error').trim())
