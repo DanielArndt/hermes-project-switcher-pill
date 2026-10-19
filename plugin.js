@@ -710,6 +710,108 @@ async function openNewSessionInProject(targetPath, targetProfile, targetId, pres
   return true
 }
 
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`
+}
+
+// Resolve branch + worktree facts for a folder. `git-dir` differs from
+// `git-common-dir` only inside a linked worktree.
+async function fetchGitContext(cwd) {
+  const q = shellQuote(cwd)
+  const res = await host
+    .request('shell.exec', {
+      command: `git -C ${q} rev-parse --show-toplevel --abbrev-ref HEAD --absolute-git-dir --path-format=absolute --git-common-dir 2>/dev/null`
+    })
+    .catch(() => null)
+  const lines = String(res?.stdout || '')
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean)
+  if (res?.code !== 0 || lines.length < 4) return null
+  const [root, branch, gitDir, commonDir] = lines
+  return {
+    root,
+    branch: branch === 'HEAD' ? '' : branch,
+    isLinkedWorktree: normalizePath(gitDir) !== normalizePath(commonDir)
+  }
+}
+
+// Opens the focused chat's folder in VS Code. Since a worktree session's cwd is
+// the worktree directory itself, opening the cwd opens the right branch checkout.
+function OpenInVSCodeButton({ cwd, placement }) {
+  const [opening, setOpening] = useState(false)
+  const target = String(cwd || '').trim()
+  const enabled = Boolean(target) && !isHomeDirectoryCwd(target)
+
+  const { data: git } = useQuery({
+    queryKey: [ID, 'git', target],
+    queryFn: () => fetchGitContext(target),
+    enabled,
+    staleTime: 10_000,
+    refetchInterval: 20_000
+  })
+
+  if (!enabled) return null
+
+  const detail = git?.branch
+    ? `${git.branch}${git.isLinkedWorktree ? ' · worktree' : ''}`
+    : ''
+  const label = `Open ${displayPath(target)}${detail ? ` (${detail})` : ''} in VS Code`
+
+  const open = async () => {
+    if (opening) return
+    haptic('tap')
+    setOpening(true)
+    try {
+      const res = await host.request('shell.exec', {
+        command: `nohup code -- ${shellQuote(target)} >/dev/null 2>&1 &`
+      })
+      if (res?.code && res.code !== 0) {
+        throw new Error(String(res.stderr || 'code exited with an error').trim())
+      }
+    } catch (err) {
+      host.notifyError?.(err, 'Failed to open VS Code')
+    } finally {
+      setTimeout(() => setOpening(false), 600)
+    }
+  }
+
+  const isAbove = placement === 'above'
+
+  return jsx(Tip, {
+    label,
+    side: 'top',
+    children: jsx(Button, {
+      'aria-label': label,
+      className: cn(
+        isAbove
+          ? 'h-(--composer-control-size) shrink-0 gap-1.5 rounded-full border border-border/65 bg-(--composer-fill) px-2.5 text-xs font-normal backdrop-blur-[0.75rem] [-webkit-backdrop-filter:blur(0.75rem)]'
+          : 'h-(--composer-control-size) shrink-0 gap-1.5 rounded-md px-2 text-xs font-normal',
+        'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) hover:text-foreground'
+      ),
+      disabled: opening,
+      onClick: () => {
+        void open()
+      },
+      type: 'button',
+      variant: 'ghost',
+      children: [
+        jsx(Codicon, { key: 'icon', name: 'vscode', size: '0.8rem' }),
+        git?.branch
+          ? jsx(
+              'span',
+              {
+                className: 'max-w-32 truncate font-mono text-[0.625rem] text-(--ui-text-tertiary)',
+                children: git.branch
+              },
+              'branch'
+            )
+          : null
+      ]
+    })
+  })
+}
+
 function ProjectSelectorPill({ placement, prefsAtom }) {
   const prefs = useValue(prefsAtom)
   const rawCwd = useValue(host.state.cwd)
@@ -1288,19 +1390,28 @@ function ProjectSelectorPill({ placement, prefsAtom }) {
     ]
   })
 
+  const vscodeButton = jsx(OpenInVSCodeButton, { cwd: effectiveCwd, placement })
+
   if (isAbove) {
     return jsx('div', {
       'data-project-pill-above': '',
       className:
         'pointer-events-none absolute bottom-full left-0 z-20 mb-1.5 flex w-full items-center px-[5px]',
-      children: jsx('div', {
-        className: 'pointer-events-auto',
-        children: dropdown
+      children: jsxs('div', {
+        className: 'pointer-events-auto flex min-w-0 items-center gap-1.5',
+        children: [dropdown, vscodeButton]
       })
     })
   }
 
-  return dropdown
+  if (isTopBanner) {
+    return jsxs('div', {
+      className: 'flex w-full items-center gap-1',
+      children: [jsx('div', { className: 'min-w-0 flex-1', children: dropdown }), vscodeButton]
+    })
+  }
+
+  return jsxs(Fragment, { children: [dropdown, vscodeButton] })
 }
 
 export default {
