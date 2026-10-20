@@ -827,6 +827,79 @@ function OpenInVSCodeButton({ cwd, placement }) {
   })
 }
 
+// Pulls the latest upstream changes into the focused chat's folder. Fast-forward
+// only, so it never creates a merge commit or leaves a conflicted tree behind;
+// a diverged or dirty branch surfaces git's own message instead.
+function PullButton({ cwd, placement }) {
+  const [pulling, setPulling] = useState(false)
+  const target = String(cwd || '').trim()
+  const enabled = Boolean(target) && !isHomeDirectoryCwd(target)
+
+  const { data: git } = useQuery({
+    queryKey: [ID, 'git', target],
+    queryFn: () => fetchGitContext(target),
+    enabled,
+    staleTime: 10_000,
+    refetchInterval: 20_000
+  })
+
+  if (!enabled || !git) return null
+
+  const label = `Pull latest upstream changes${git.branch ? ` into ${git.branch}` : ''}`
+
+  const pull = async () => {
+    if (pulling) return
+    haptic('tap')
+    setPulling(true)
+    try {
+      const res = await host.request('shell.exec', {
+        command: `git -C ${shellQuote(target)} pull --ff-only 2>&1`
+      })
+      const out = String(res?.stdout || res?.stderr || '').trim()
+      if (res?.code && res.code !== 0) {
+        throw new Error(out || 'git pull failed')
+      }
+      host.notify({
+        durationMs: 3_000,
+        kind: 'info',
+        message: out.split('\n').pop() || 'Pulled latest changes'
+      })
+      void queryClient.invalidateQueries({ queryKey: [ID, 'git', target] })
+      // The host's branch/ahead-behind line (composer status row) re-probes git
+      // on window focus and doesn't expose a refresh hook to plugins, so fire
+      // the same edge it listens for. Relies on that host behavior.
+      window.dispatchEvent(new Event('focus'))
+    } catch (err) {
+      host.notifyError?.(err, 'Failed to pull')
+    } finally {
+      setPulling(false)
+    }
+  }
+
+  const isAbove = placement === 'above'
+
+  return jsx(Tip, {
+    label,
+    side: 'top',
+    children: jsx(Button, {
+      'aria-label': label,
+      className: cn(
+        isAbove
+          ? 'h-(--composer-control-size) shrink-0 gap-1.5 rounded-full border border-border/65 bg-(--composer-fill) px-2.5 text-xs font-normal backdrop-blur-[0.75rem] [-webkit-backdrop-filter:blur(0.75rem)]'
+          : 'h-(--composer-control-size) shrink-0 gap-1.5 rounded-md px-2 text-xs font-normal',
+        'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) hover:text-foreground'
+      ),
+      disabled: pulling,
+      onClick: () => {
+        void pull()
+      },
+      type: 'button',
+      variant: 'ghost',
+      children: jsx(Codicon, { name: pulling ? 'loading' : 'repo-pull', size: '0.8rem', spinning: pulling })
+    })
+  })
+}
+
 function ProjectSelectorPill({ placement, prefsAtom }) {
   const prefs = useValue(prefsAtom)
   const rawCwd = useValue(host.state.cwd)
@@ -1406,6 +1479,7 @@ function ProjectSelectorPill({ placement, prefsAtom }) {
   })
 
   const vscodeButton = jsx(OpenInVSCodeButton, { cwd: effectiveCwd, placement })
+  const pullButton = jsx(PullButton, { cwd: effectiveCwd, placement })
 
   if (isAbove) {
     return jsx('div', {
@@ -1414,19 +1488,18 @@ function ProjectSelectorPill({ placement, prefsAtom }) {
         'pointer-events-none absolute bottom-full left-0 z-20 mb-1.5 flex w-full items-center px-[5px]',
       children: jsxs('div', {
         className: 'pointer-events-auto flex min-w-0 items-center gap-1.5',
-        children: [dropdown, vscodeButton]
-      })
+        children: [dropdown, vscodeButton, pullButton]      })
     })
   }
 
   if (isTopBanner) {
     return jsxs('div', {
       className: 'flex w-full items-center gap-1',
-      children: [jsx('div', { className: 'min-w-0 flex-1', children: dropdown }), vscodeButton]
+      children: [jsx('div', { className: 'min-w-0 flex-1', children: dropdown }), vscodeButton, pullButton]
     })
   }
 
-  return jsxs(Fragment, { children: [dropdown, vscodeButton] })
+  return jsxs(Fragment, { children: [dropdown, vscodeButton, pullButton] })
 }
 
 export default {
