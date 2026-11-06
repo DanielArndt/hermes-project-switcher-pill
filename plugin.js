@@ -712,18 +712,29 @@ async function openNewSessionInProject(targetPath, targetProfile, targetId, pres
 
 // The gateway is often a long-lived background service with no display session
 // in its environment, so a bare `code` starts, finds no display and exits
-// silently. Rebuild the display env first (prefer Wayland, fall back to X11).
+// silently. Rebuild the display env first (prefer Wayland, fall back to X11),
+// and recover XDG_CURRENT_DESKTOP from the user manager so VS Code can pick
+// the right OS keyring backend.
 // Sent as plain shell (shell.exec already runs through a shell) because the
 // gateway's safety filter rejects `sh -c ...`.
 const VSCODE_LAUNCH_SCRIPT = [
   'rt="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"',
   'export XDG_RUNTIME_DIR="$rt"',
   'flags=""',
+  'if [ -z "$XDG_CURRENT_DESKTOP" ]; then XDG_CURRENT_DESKTOP=$(systemctl --user show-environment 2>/dev/null | sed -n "s/^XDG_CURRENT_DESKTOP=//p"); [ -n "$XDG_CURRENT_DESKTOP" ] && export XDG_CURRENT_DESKTOP; fi',
   'if [ -z "$WAYLAND_DISPLAY" ]; then WAYLAND_DISPLAY=$(ls "$rt" 2>/dev/null | grep -E "^wayland-[0-9]+$" | head -1); fi',
   'if [ -n "$WAYLAND_DISPLAY" ] && [ -S "$rt/$WAYLAND_DISPLAY" ]; then export WAYLAND_DISPLAY; unset DISPLAY; flags="--ozone-platform=wayland"',
   'elif [ -z "$DISPLAY" ]; then x=$(ls /tmp/.X11-unix 2>/dev/null | grep -E "^X[0-9]+$" | head -1); [ -n "$x" ] && export DISPLAY=":${x#X}"; fi',
   'nohup code $flags -- "$1" >/dev/null 2>&1 &'
 ].join('\n')
+
+// Newer gateways serve `shell.exec` from the session-scoped handler, which
+// rejects calls without a `session_id` (invalid_params). Pass the focused
+// session when there is one; a draft with no session falls back to the bare form.
+function shellExec(params) {
+  const sid = host.state.focusedSessionId?.get?.() || host.state.activeSessionId?.get?.() || null
+  return host.request('shell.exec', sid ? { session_id: sid, ...params } : params)
+}
 
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`
@@ -733,11 +744,9 @@ function shellQuote(value) {
 // `git-common-dir` only inside a linked worktree.
 async function fetchGitContext(cwd) {
   const q = shellQuote(cwd)
-  const res = await host
-    .request('shell.exec', {
-      command: `git -C ${q} rev-parse --show-toplevel --abbrev-ref HEAD --absolute-git-dir --path-format=absolute --git-common-dir 2>/dev/null`
-    })
-    .catch(() => null)
+  const res = await shellExec({
+    command: `git -C ${q} rev-parse --show-toplevel --abbrev-ref HEAD --absolute-git-dir --path-format=absolute --git-common-dir 2>/dev/null`
+  }).catch(() => null)
   const lines = String(res?.stdout || '')
     .split('\n')
     .map(l => l.trim())
@@ -778,7 +787,7 @@ function OpenInVSCodeButton({ cwd, placement }) {
     haptic('tap')
     setOpening(true)
     try {
-      const res = await host.request('shell.exec', {
+      const res = await shellExec({
         command: `set -- ${shellQuote(target)}\n${VSCODE_LAUNCH_SCRIPT}`
       })
       if (res?.code && res.code !== 0) {
@@ -852,7 +861,7 @@ function PullButton({ cwd, placement }) {
     haptic('tap')
     setPulling(true)
     try {
-      const res = await host.request('shell.exec', {
+      const res = await shellExec({
         command: `git -C ${shellQuote(target)} pull --ff-only 2>&1`
       })
       const out = String(res?.stdout || res?.stderr || '').trim()
@@ -896,6 +905,79 @@ function PullButton({ cwd, placement }) {
       type: 'button',
       variant: 'ghost',
       children: jsx(Codicon, { name: pulling ? 'loading' : 'repo-pull', size: '0.8rem', spinning: pulling })
+    })
+  })
+}
+
+// Pushes the current branch of the focused chat's folder to its upstream (or to
+// origin, setting upstream, when the branch has none). Never forces; a rejected
+// push surfaces git's own message instead.
+function PushButton({ cwd, placement }) {
+  const [pushing, setPushing] = useState(false)
+  const target = String(cwd || '').trim()
+  const enabled = Boolean(target) && !isHomeDirectoryCwd(target)
+
+  const { data: git } = useQuery({
+    queryKey: [ID, 'git', target],
+    queryFn: () => fetchGitContext(target),
+    enabled,
+    staleTime: 10_000,
+    refetchInterval: 20_000
+  })
+
+  if (!enabled || !git) return null
+
+  const label = `Push ${git.branch || 'current branch'} to upstream`
+
+  const push = async () => {
+    if (pushing) return
+    haptic('tap')
+    setPushing(true)
+    try {
+      const res = await shellExec({
+        command: `git -C ${shellQuote(target)} push 2>&1`
+      })
+      const out = String(res?.stdout || res?.stderr || '').trim()
+      if (res?.code && res.code !== 0) {
+        throw new Error(out || 'git push failed')
+      }
+      host.notify({
+        durationMs: 3_000,
+        kind: 'info',
+        message: out.split('\n').pop() || 'Pushed changes'
+      })
+      void queryClient.invalidateQueries({ queryKey: [ID, 'git', target] })
+      // The host's branch/ahead-behind line (composer status row) re-probes git
+      // on window focus and doesn't expose a refresh hook to plugins, so fire
+      // the same edge it listens for. Relies on that host behavior.
+      window.dispatchEvent(new Event('focus'))
+    } catch (err) {
+      host.notifyError?.(err, 'Failed to push')
+    } finally {
+      setPushing(false)
+    }
+  }
+
+  const isAbove = placement === 'above'
+
+  return jsx(Tip, {
+    label,
+    side: 'top',
+    children: jsx(Button, {
+      'aria-label': label,
+      className: cn(
+        isAbove
+          ? 'h-(--composer-control-size) shrink-0 gap-1.5 rounded-full border border-border/65 bg-(--composer-fill) px-2.5 text-xs font-normal backdrop-blur-[0.75rem] [-webkit-backdrop-filter:blur(0.75rem)]'
+          : 'h-(--composer-control-size) shrink-0 gap-1.5 rounded-md px-2 text-xs font-normal',
+        'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) hover:text-foreground'
+      ),
+      disabled: pushing,
+      onClick: () => {
+        void push()
+      },
+      type: 'button',
+      variant: 'ghost',
+      children: jsx(Codicon, { name: pushing ? 'loading' : 'repo-push', size: '0.8rem', spinning: pushing })
     })
   })
 }
@@ -1480,6 +1562,7 @@ function ProjectSelectorPill({ placement, prefsAtom }) {
 
   const vscodeButton = jsx(OpenInVSCodeButton, { cwd: effectiveCwd, placement })
   const pullButton = jsx(PullButton, { cwd: effectiveCwd, placement })
+  const pushButton = jsx(PushButton, { cwd: effectiveCwd, placement })
 
   if (isAbove) {
     return jsx('div', {
@@ -1488,18 +1571,19 @@ function ProjectSelectorPill({ placement, prefsAtom }) {
         'pointer-events-none absolute bottom-full left-0 z-20 mb-1.5 flex w-full items-center px-[5px]',
       children: jsxs('div', {
         className: 'pointer-events-auto flex min-w-0 items-center gap-1.5',
-        children: [dropdown, vscodeButton, pullButton]      })
+        children: [dropdown, vscodeButton, pullButton, pushButton]
+      })
     })
   }
 
   if (isTopBanner) {
     return jsxs('div', {
       className: 'flex w-full items-center gap-1',
-      children: [jsx('div', { className: 'min-w-0 flex-1', children: dropdown }), vscodeButton, pullButton]
+      children: [jsx('div', { className: 'min-w-0 flex-1', children: dropdown }), vscodeButton, pullButton, pushButton]
     })
   }
 
-  return jsxs(Fragment, { children: [dropdown, vscodeButton, pullButton] })
+  return jsxs(Fragment, { children: [dropdown, vscodeButton, pullButton, pushButton] })
 }
 
 export default {
